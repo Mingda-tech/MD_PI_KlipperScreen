@@ -2,11 +2,10 @@ import logging
 import gi
 import os
 import subprocess
-import mpv
-from contextlib import suppress
-from PIL import Image, ImageDraw, ImageFont
+import urllib.request
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Pango
+from gi.repository import Gtk, Pango, GdkPixbuf, GLib
+import cairo
 from ks_includes.KlippyGcodes import KlippyGcodes
 from ks_includes.screen_panel import ScreenPanel
 
@@ -22,14 +21,9 @@ class Panel(ScreenPanel):
         self.is_home = False
         self.current_extruder = self._printer.get_stat("toolhead", "extruder")
         self.menu = ['main_menu']
-        self.pos['e1_xoffset'] = None
-        self.pos['e1_yoffset'] = None
-        if self._screen.klippy_config is not None:
-            try:
-                self.pos['e1_xoffset'] = self._screen.klippy_config.getfloat("Variables", "e1_xoffset")
-                self.pos['e1_yoffset'] = self._screen.klippy_config.getfloat("Variables", "e1_yoffset")
-            except Exception as e:
-                logging.error(f"Read {self._screen.klippy_config_path} error:\n{e}")
+        self.camera_timeout = None
+        self.current_cam = None
+        self.camera_playing = False
 
         self.buttons = {
             'x+': self._gtk.Button(None, "X+", "color1"),
@@ -97,30 +91,40 @@ class Panel(ScreenPanel):
 
         self.labels['confirm'].connect("clicked", self.confirm_extrude_position)
         self.labels['save'].connect("clicked", self.save_offset)
-        offsetgrid.attach(self.labels['confirm'], 0, 0, 1, 1)           
-        offsetgrid.attach(self.labels['save'], 1, 0, 1, 1)   
+        offsetgrid.attach(self.labels['confirm'], 0, 0, 1, 1)
+        offsetgrid.attach(self.labels['save'], 1, 0, 1, 1)
 
-        self.mpv = None
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        for i, cam in enumerate(self._printer.cameras):
-            if not cam["enabled"] or cam["name"] != 'calicam':
-                continue
-            logging.info(cam)
-            cam[cam["name"]] = self._gtk.Button(
-                image_name="camera", label=_("Start"), style=f"color{i % 4 + 1}",
-                scale=self.bts, position=Gtk.PositionType.LEFT, lines=1
-            )
-            cam[cam["name"]].set_hexpand(True)
-            cam[cam["name"]].set_vexpand(True)
-            cam[cam["name"]].connect("clicked", self.play, cam)
-            box.add(cam[cam["name"]])
+        # Camera image area - use Frame to prevent expansion
+        self.camera_frame = Gtk.Frame()
+        self.camera_image = Gtk.Image()
+        self.camera_frame.add(self.camera_image)
+        self.camera_frame.set_hexpand(False)
+        self.camera_frame.set_vexpand(False)
 
-        self.scroll = self._gtk.ScrolledWindow()
-        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.scroll.add(box)
-        
+        # Find calicam camera
+        for cam in self._printer.cameras:
+            if cam["enabled"] and cam["name"] == 'calicam':
+                self.current_cam = cam
+                logging.debug(f"Found calibration camera: {cam['name']}")
+                break
+
+        # Start button for camera - fills the whole left area
+        self.labels['start_cam'] = self._gtk.Button(
+            image_name="camera", label=_("Start"), style="color1",
+            scale=self.bts, position=Gtk.PositionType.LEFT, lines=1
+        )
+        self.labels['start_cam'].set_hexpand(True)
+        self.labels['start_cam'].set_vexpand(True)
+        self.labels['start_cam'].connect("clicked", self.play)
+
+        # Use a Stack to switch between button and camera
+        self.camera_stack = Gtk.Stack()
+        self.camera_stack.add_named(self.labels['start_cam'], "button")
+        self.camera_stack.add_named(self.camera_frame, "camera")
+        self.camera_stack.set_visible_child_name("button")
+
         self.labels['main_menu'] = self._gtk.HomogeneousGrid()
-        self.labels['main_menu'].attach(self.scroll, 0, 0, 3, 6)
+        self.labels['main_menu'].attach(self.camera_stack, 0, 0, 3, 6)
         self.labels['main_menu'].attach(grid, 3, 0, 2, 3)
         self.labels['main_menu'].attach(distgrid, 3, 3, 2, 2)
         self.labels['main_menu'].attach(offsetgrid, 3, 5, 2, 1)
@@ -128,41 +132,43 @@ class Panel(ScreenPanel):
         self.content.add(self.labels['main_menu'])
         self.reset_pos()
 
+    def _run_light_on(self):
+        """Turn on calibration light if macro exists"""
+        if "XY_CALIBRATION_LIGHT_ON" in self._printer.get_gcode_macros():
+            self._screen._ws.klippy.gcode_script("XY_CALIBRATION_LIGHT_ON")
+            logging.info("Executing XY_CALIBRATION_LIGHT_ON macro")
+
+    def _run_light_off(self):
+        """Turn off calibration light if macro exists"""
+        if "XY_CALIBRATION_LIGHT_OFF" in self._printer.get_gcode_macros():
+            self._screen._ws.klippy.gcode_script("XY_CALIBRATION_LIGHT_OFF")
+            logging.info("Executing XY_CALIBRATION_LIGHT_OFF macro")
+
     def process_update(self, action, data):
         if action != "notify_status_update":
             return
         homed_axes = self._printer.get_stat("toolhead", "homed_axes")
         if homed_axes == "xyz":
-            if "gcode_move" in data and "gcode_position" in data["gcode_move"]:
-                # self.labels['pos_x'].set_text(f"X: {data['gcode_move']['gcode_position'][0]:.2f}")
-                # self.labels['pos_y'].set_text(f"Y: {data['gcode_move']['gcode_position'][1]:.2f}")
-                # self.labels['pos_z'].set_text(f"Z: {data['gcode_move']['gcode_position'][2]:.2f}")
-
-                self.pos['x'] = data['gcode_move']['gcode_position'][0]
-                self.pos['y'] = data['gcode_move']['gcode_position'][1]
-                self.pos['z'] = data['gcode_move']['gcode_position'][2]  
-                # text = f"x: {data['gcode_move']['gcode_position'][0]:.2f}, y: {data['gcode_move']['gcode_position'][1]:.2f}, z: {data['gcode_move']['gcode_position'][2]:.2f}"          
+            # Use toolhead position (raw coordinates without offsets) instead of gcode_position
+            if "toolhead" in data and "position" in data["toolhead"]:
+                self.pos['x'] = data['toolhead']['position'][0]
+                self.pos['y'] = data['toolhead']['position'][1]
+                self.pos['z'] = data['toolhead']['position'][2]  
         else:
             if "x" in homed_axes:
-                if "gcode_move" in data and "gcode_position" in data["gcode_move"]:
-                    # self.labels['pos_x'].set_text(f"X: {data['gcode_move']['gcode_position'][0]:.2f}")
-                    self.pos['x'] = data['gcode_move']['gcode_position'][0]
+                if "toolhead" in data and "position" in data["toolhead"]:
+                    self.pos['x'] = data['toolhead']['position'][0]
             else:
-                # self.labels['pos_x'].set_text("X: ?")
                 self.pos['x'] = None
             if "y" in homed_axes:
-                if "gcode_move" in data and "gcode_position" in data["gcode_move"]:
-                    # self.labels['pos_y'].set_text(f"Y: {data['gcode_move']['gcode_position'][1]:.2f}")
-                    self.pos['y'] = data['gcode_move']['gcode_position'][1]
+                if "toolhead" in data and "position" in data["toolhead"]:
+                    self.pos['y'] = data['toolhead']['position'][1]
             else:
-                # self.labels['pos_y'].set_text("Y: ?")
                 self.pos['y'] = None
             if "z" in homed_axes:
-                if "gcode_move" in data and "gcode_position" in data["gcode_move"]:
-                    self.labels['pos_z'].set_text(f"Z: {data['gcode_move']['gcode_position'][2]:.2f}")
-                    self.pos['z'] = data['gcode_move']['gcode_position'][2]
+                if "toolhead" in data and "position" in data["toolhead"]:
+                    self.pos['z'] = data['toolhead']['position'][2]
             else:
-                # self.labels['pos_z'].set_text("Z: ?")
                 self.pos['z'] = None
 
 
@@ -239,9 +245,9 @@ class Panel(ScreenPanel):
         self.labels[boxname].show_all()
 
     def back(self):
-        if self.mpv:
-            self.mpv.terminate()
-            self.mpv = None                    
+        if self.camera_playing:
+            self.stop_camera()
+            self._run_light_off()
         if len(self.menu) > 1:
             self.unload_menu()
             return True
@@ -264,10 +270,9 @@ class Panel(ScreenPanel):
             if self.pos['lx'] is None or self.pos['ly'] is None or self.pos['lz'] is None:
                 self._screen.show_popup_message(f"Please confirm left extruder position.", level = 2)
             else:
-                self.pos['ox'] = self.pos['x'] - self.pos['lx']
-                self.pos['oy'] = self.pos['y'] - self.pos['ly']
-                self.pos['oz'] = self.pos['z']  - self.pos['lz']
-                self._screen.show_popup_message(f"Right extruder offset is ({self.pos['ox']:.2f}, {self.pos['oy']:.2f}, {self.pos['oz']:.2f})", level = 1)
+                self.pos['ox'] = self.pos['lx'] - self.pos['x']
+                self.pos['oy'] = self.pos['ly'] - self.pos['y']
+                self._screen.show_popup_message(f"Right extruder offset is ({self.pos['ox']:.2f}, {self.pos['oy']:.2f})", level = 1)
                 self.labels['save'].set_sensitive(True)                      
 
     def change_extruder(self, widget, extruder):
@@ -275,49 +280,43 @@ class Panel(ScreenPanel):
                                   {"script": f"T{self._printer.get_tool_number(extruder)}"})
         
     def save_offset(self, widget):      
-        if self.pos['e1_xoffset'] is None or self.pos['e1_yoffset'] is None:
-            return
         if self.pos['ox'] is None or self.pos['oy'] is None:
             self._screen.show_popup_message(_("Need to recalculate the offset value."), level = 2)
-        else:
-            self.pos['e1_xoffset'] += self.pos['ox']
-            self.pos['e1_yoffset'] += self.pos['oy']
-            try:
-                self._screen.klippy_config.set("Variables", "e1_xoffset", f"{self.pos['e1_xoffset']:.2f}")
-                self._screen.klippy_config.set("Variables", "e1_yoffset", f"{self.pos['e1_yoffset']:.2f}")
-                self._screen.klippy_config.set("Variables", "cam_xpos", f"{self.pos['lx']:.2f}")
-                self._screen.klippy_config.set("Variables", "cam_ypos", f"{self.pos['ly']:.2f}")
-                logging.info(f"xy offset change to x: {self.pos['e1_xoffset']:.2f} y: {self.pos['e1_yoffset']:.2f}")
-                with open(self._screen.klippy_config_path, 'w') as file:
-                    self._screen.klippy_config.write(file)
-                    if self.mpv:
-                        self.mpv.terminate()
-                        self.mpv = None
-                    self.save_config()                    
-                    self._screen._menu_go_back()
-            except Exception as e:
-                logging.error(f"Error writing configuration file in {self._screen.klippy_config_path}:\n{e}")
-                self._screen.show_popup_message(_("Error writing configuration"))
-                self.pos['e1_xoffset'] -= self.pos['ox']
-                self.pos['e1_yoffset'] -= self.pos['oy']
+            return
+        
+        try:
+            self._screen.klippy_config.set("Variables", "idex_xoffset", f"{self.pos['ox']:.2f}")
+            self._screen.klippy_config.set("Variables", "idex_yoffset", f"{self.pos['oy']:.2f}")
+            self._screen.klippy_config.set("Variables", "cam_xpos", f"{self.pos['lx']:.2f}")
+            self._screen.klippy_config.set("Variables", "cam_ypos", f"{self.pos['ly']:.2f}")
+            logging.info(f"xy offset set to x: {self.pos['ox']:.2f} y: {self.pos['oy']:.2f}")
+            with open(self._screen.klippy_config_path, 'w') as file:
+                self._screen.klippy_config.write(file)
+                if self.camera_playing:
+                    self.stop_camera()
+                    self._run_light_off()
+                self.save_config()
+                self._screen._menu_go_back()
+        except Exception as e:
+            logging.error(f"Error writing configuration file in {self._screen.klippy_config_path}:\n{e}")
+            self._screen.show_popup_message(_("Error writing configuration"))
             
-    def play(self, widget, cam):
-        url = cam['stream_url']
-        if url.startswith('/'):
-            logging.info("camera URL is relative")
-            endpoint = self._screen.apiclient.endpoint.split(':')
-            url = f"{endpoint[0]}:{endpoint[1]}{url}"
-        vf = ""
-        if cam["flip_horizontal"]:
-            vf += "hflip,"
-        if cam["flip_vertical"]:
-            vf += "vflip,"
-        vf += f"rotate:{cam['rotation']*3.14159/180}"
-        logging.info(f"video filters: {vf}")
+    def play(self, widget):
+        if not self.current_cam:
+            self._screen.show_popup_message(_("No calibration camera found."), level=2)
+            return
+
+        url = self.get_snapshot_url()
+        if not url:
+            self._screen.show_popup_message(_("No camera URL available."), level=2)
+            return
 
         if check_web_page_access(url) == False:
             self._screen.show_popup_message(_("Please wait for the camera initialization to complete."), level=1)
             return
+
+        self._run_light_on()
+
         self.reset_pos()
         if self._printer.get_stat("toolhead", "homed_axes") != "xyz":
             self._screen._ws.klippy.gcode_script("G28")
@@ -326,49 +325,157 @@ class Panel(ScreenPanel):
             self.change_extruder(widget=None, extruder="extruder")
         self._calculate_position()
 
+        # Switch to camera view and start camera
+        self.camera_stack.set_visible_child_name("camera")
+        self.start_camera()
 
-        if self.mpv:
-            self.mpv.terminate()
-        # self.mpv = mpv.MPV(fullscreen=False, log_handler=self.log, vo='gpu,wlshm,xv,x11', geometry = '400x240')
-        # self.mpv = mpv.MPV(fullscreen=True, log_handler=self.log, vo='gpu,xv', wid=str(widget.get_property("window").get_xid()))
-        self.mpv = mpv.MPV(fullscreen=True, log_handler=self.log, vo='gpu,wlshm,xv,x11', wid=str(widget.get_property("window").get_xid()))
-        self.mpv.vf = vf
+    def get_snapshot_url(self):
+        """Get the snapshot URL for the camera"""
+        if not self.current_cam:
+            return None
+        url = self.current_cam.get('snapshot_url', self.current_cam.get('stream_url', ''))
+        if not url:
+            return None
+        if url.startswith('/'):
+            endpoint = self._screen.apiclient.endpoint.split(':')
+            url = f"{endpoint[0]}:{endpoint[1]}{url}"
+        return url
 
-        with suppress(Exception):
-            self.mpv.profile = 'sw-fast'
+    def start_camera(self):
+        """Start camera snapshot refresh"""
+        if self.current_cam:
+            self.camera_playing = True
+            logging.debug(f"Starting camera: {self.current_cam['name']}")
+            self.update_camera_image()
 
-        # LOW LATENCY PLAYBACK
-        with suppress(Exception):
-            self.mpv.profile = 'low-latency'
-        self.mpv.untimed = True
-        self.mpv.audio = 'no'
+    def stop_camera(self):
+        """Stop camera snapshot refresh"""
+        if self.camera_timeout:
+            GLib.source_remove(self.camera_timeout)
+            self.camera_timeout = None
+        self.camera_playing = False
+        logging.debug("Camera stopped")
 
-        logging.debug(f"Camera URL: {url}")
-        self.mpv.loop = True
-        self.mpv.play(url)
+    def update_camera_image(self):
+        """Fetch and update camera snapshot with XY overlay"""
+        if not self.current_cam or not self.camera_playing:
+            return False
+
+        url = self.get_snapshot_url()
+        if not url:
+            return False
 
         try:
-            self.mpv.wait_until_playing()
-            # self.mpv.wait_for_playback()
-        except mpv.ShutdownError:
-            logging.info('Exiting Fullscreen')
-            return
-        except Exception as e:
-            logging.exception(e)
-            return
+            with urllib.request.urlopen(url, timeout=2) as response:
+                data = response.read()
 
-        font = ImageFont.truetype('DejaVuSans.ttf', 10)
-        font1 = ImageFont.truetype('DejaVuSans.ttf', 12)
-        self.overlay = self.mpv.create_image_overlay()
-        img = Image.new('RGBA', (400, 150),  (255, 255, 255, 0))
-        d = ImageDraw.Draw(img)
-        base_pos = [80, 0]
-        d.text((base_pos[0], base_pos[1]+30), '___________________',font=font, fill=(255, 0, 0, 255))
-        d.text((base_pos[0]+90, base_pos[1]+33), '>',font=font1, fill=(255, 0, 0, 255))
-        d.text((base_pos[0]+36, base_pos[1]), '^',font=font1, fill=(0, 255, 0, 255))
-        for pos in range (base_pos[1], base_pos[1] + 80, 10):
-            d.text((base_pos[0]+40, pos), '|', font=font, fill=(0, 255, 0, 255))
-        self.overlay.update(img, pos=(40, 65))
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(data)
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+
+            if pixbuf:
+                # Apply rotation
+                rotation = self.current_cam.get('rotation', 0)
+                if rotation == 90:
+                    pixbuf = pixbuf.rotate_simple(GdkPixbuf.PixbufRotation.CLOCKWISE)
+                elif rotation == 180:
+                    pixbuf = pixbuf.rotate_simple(GdkPixbuf.PixbufRotation.UPSIDEDOWN)
+                elif rotation == 270:
+                    pixbuf = pixbuf.rotate_simple(GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE)
+
+                # Apply flip
+                if self.current_cam.get('flip_horizontal', False):
+                    pixbuf = pixbuf.flip(True)
+                if self.current_cam.get('flip_vertical', False):
+                    pixbuf = pixbuf.flip(False)
+
+                img_width = pixbuf.get_width()
+                img_height = pixbuf.get_height()
+
+                # Scale to fit - Grid is 5 columns, camera is in columns 0-2 (3 columns = 60% width)
+                max_width = self._gtk.content_width * 3 // 5
+                max_height = self._gtk.content_height
+
+                scale_w = max_width / img_width
+                scale_h = max_height / img_height
+                # Use max scale to fill the area (may crop some parts)
+                scale = max(scale_w, scale_h)
+
+                new_width = int(img_width * scale)
+                new_height = int(img_height * scale)
+
+                if new_width > 0 and new_height > 0:
+                    pixbuf = pixbuf.scale_simple(new_width, new_height, GdkPixbuf.InterpType.BILINEAR)
+
+                    # Crop to fit the target area if needed
+                    if new_width > max_width or new_height > max_height:
+                        crop_x = max(0, (new_width - max_width) // 2)
+                        crop_y = max(0, (new_height - max_height) // 2)
+                        crop_w = min(max_width, new_width)
+                        crop_h = min(max_height, new_height)
+                        try:
+                            pixbuf = pixbuf.new_subpixbuf(crop_x, crop_y, crop_w, crop_h)
+                        except Exception as e:
+                            logging.warning(f"Crop failed: {e}")
+
+                # Draw XY coordinate overlay AFTER scaling/cropping so it's centered on the displayed frame
+                final_width = pixbuf.get_width()
+                final_height = pixbuf.get_height()
+
+                from gi.repository import Gdk
+                surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, final_width, final_height)
+                cr = cairo.Context(surface)
+
+                # Draw the pixbuf first
+                Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+                cr.paint()
+
+                # Draw XY coordinate system - centered on the frame
+                center_x = final_width // 2
+                center_y = final_height // 2
+                axis_length = 200
+                line_width = 1
+                arrow_size = 10
+
+                # Draw X axis (horizontal line - red)
+                cr.set_source_rgba(1, 0, 0, 1)
+                cr.set_line_width(line_width)
+                cr.move_to(center_x - axis_length, center_y)
+                cr.line_to(center_x + axis_length, center_y)
+                cr.stroke()
+
+                # Draw X axis arrow
+                cr.move_to(center_x + axis_length, center_y)
+                cr.line_to(center_x + axis_length - arrow_size, center_y - arrow_size // 2)
+                cr.line_to(center_x + axis_length - arrow_size, center_y + arrow_size // 2)
+                cr.close_path()
+                cr.fill()
+
+                # Draw Y axis (vertical line - green)
+                cr.set_source_rgba(0, 1, 0, 1)
+                cr.move_to(center_x, center_y - axis_length)
+                cr.line_to(center_x, center_y + axis_length)
+                cr.stroke()
+
+                # Draw Y axis arrow
+                cr.move_to(center_x, center_y - axis_length)
+                cr.line_to(center_x - arrow_size // 2, center_y - axis_length + arrow_size)
+                cr.line_to(center_x + arrow_size // 2, center_y - axis_length + arrow_size)
+                cr.close_path()
+                cr.fill()
+
+                # Convert cairo surface back to pixbuf
+                pixbuf = Gdk.pixbuf_get_from_surface(surface, 0, 0, final_width, final_height)
+
+                self.camera_image.set_from_pixbuf(pixbuf)
+
+        except Exception as e:
+            logging.warning(f"Failed to update camera image: {e}")
+
+        # Schedule next update (100ms = 10 FPS)
+        self.camera_timeout = GLib.timeout_add(100, self.update_camera_image)
+        return False
 
     def log(self, loglevel, component, message):
         logging.debug(f'[{loglevel}] {component}: {message}')
@@ -384,7 +491,6 @@ class Panel(ScreenPanel):
         self.pos['rz'] = None 
         self.pos['ox'] = None
         self.pos['oy'] = None
-        self.pos['oz'] = None 
         self.labels['save'].set_sensitive(False)
 
     def _calculate_position(self):
@@ -411,6 +517,8 @@ class Panel(ScreenPanel):
         )        
 
     def activate(self):
+        # Reset to button view
+        self.camera_stack.set_visible_child_name("button")
         symbolic_link = "/home/mingda/printer_data/config/crowsnest.conf"
         source_file = "/home/mingda/printer_data/config/crowsnest2.conf"
         create_symbolic_link(source_file, symbolic_link)
@@ -418,6 +526,10 @@ class Panel(ScreenPanel):
         self._screen.show_popup_message(_("Please wait for the camera's fill light to light up for 5 seconds before clicking 'Start'"), level=2)
 
     def deactivate(self):
+        # Stop camera
+        self.stop_camera()
+        self._run_light_off()
+
         symbolic_link = "/home/mingda/printer_data/config/crowsnest.conf"
         source_file = "/home/mingda/printer_data/config/crowsnest1.conf"
         create_symbolic_link(source_file, symbolic_link)
