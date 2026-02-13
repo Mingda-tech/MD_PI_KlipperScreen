@@ -270,8 +270,8 @@ class Panel(ScreenPanel):
             if self.pos['lx'] is None or self.pos['ly'] is None or self.pos['lz'] is None:
                 self._screen.show_popup_message(f"Please confirm left extruder position.", level = 2)
             else:
-                self.pos['ox'] = self.pos['lx'] - self.pos['x']
-                self.pos['oy'] = self.pos['ly'] - self.pos['y']
+                self.pos['ox'] = self.pos['x'] - self.pos['lx']
+                self.pos['oy'] = self.pos['y'] - self.pos['ly']
                 self._screen.show_popup_message(f"Right extruder offset is ({self.pos['ox']:.2f}, {self.pos['oy']:.2f})", level = 1)
                 self.labels['save'].set_sensitive(True)                      
 
@@ -285,8 +285,8 @@ class Panel(ScreenPanel):
             return
         
         try:
-            self._screen.klippy_config.set("Variables", "idex_xoffset", f"{self.pos['ox']:.2f}")
-            self._screen.klippy_config.set("Variables", "idex_yoffset", f"{self.pos['oy']:.2f}")
+            self._screen.klippy_config.set("Variables", "e1_xoffset", f"{self.pos['ox']:.2f}")
+            self._screen.klippy_config.set("Variables", "e1_yoffset", f"{self.pos['oy']:.2f}")
             self._screen.klippy_config.set("Variables", "cam_xpos", f"{self.pos['lx']:.2f}")
             self._screen.klippy_config.set("Variables", "cam_ypos", f"{self.pos['ly']:.2f}")
             logging.info(f"xy offset set to x: {self.pos['ox']:.2f} y: {self.pos['oy']:.2f}")
