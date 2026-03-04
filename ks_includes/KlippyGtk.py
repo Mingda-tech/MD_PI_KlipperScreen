@@ -5,7 +5,7 @@ import pathlib
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gdk, GdkPixbuf, Gio, Gtk, Pango
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
 
 
 def find_widget(widget, wanted_type):
@@ -256,12 +256,12 @@ class KlippyGtk:
     def remove_dialog(self, dialog, *args):
         if self.screen.updating:
             return
-        dialog.destroy()
         if dialog in self.screen.dialogs:
             logging.info("Removing Dialog")
             self.screen.dialogs.remove(dialog)
-            return
-        logging.debug(f"Cannot remove dialog {dialog}")
+        # Use idle_add to destroy dialog asynchronously to avoid Wayland deadlock
+        GLib.idle_add(dialog.destroy)
+        logging.debug(f"Dialog queued for destruction")
 
     @staticmethod
     def HomogeneousGrid(width=None, height=None):
