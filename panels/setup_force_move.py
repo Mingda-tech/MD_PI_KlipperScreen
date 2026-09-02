@@ -37,9 +37,9 @@ class Panel(ScreenPanel):
         
         z_up_image = "z-farther"
         z_up_label = _("Z Raise")
-        if "MD_400D" in self._printer.get_gcode_macros():
-            z_up_image = "bed_down"
-            z_up_label = _("Bed Lower")
+        if self._printer.use_bed_move():
+            z_up_image = "bed_up"
+            z_up_label = _("Bed Raise")
             
         self.z_raise_btn = self._gtk.Button(z_up_image, None, "color3", scale=.66)
         self.z_raise_btn.connect("clicked", self.move_z_up)
@@ -82,7 +82,7 @@ class Panel(ScreenPanel):
         self.distance = dist
 
     def move_z_up(self, widget):
-        dist = 70.0
+        dist = -70.0 if self._printer.use_bed_move() else 70.0
         speed = 2  # Z speed in mm/s
         
         # Check if Z is homed
@@ -97,7 +97,7 @@ class Panel(ScreenPanel):
             else:
                 # Use force move if not homed
                 logging.info(f"Force moving Z up by {dist}mm at {speed}mm/s (not homed)")
-                if dist >= 2:
+                if abs(dist) >= 2:
                     accel = 60
                     self._screen._send_action(None, "printer.gcode.script",
                         {"script": f"FORCE_MOVE STEPPER=stepper_z DISTANCE={dist} VELOCITY={speed} ACCEL={accel}"})
@@ -147,4 +147,4 @@ class Panel(ScreenPanel):
         # Scale the Pixbuf
         scaled_pixbuf = pixbuf.scale_simple(new_width, new_height, GdkPixbuf.InterpType.BILINEAR)
         
-        return scaled_pixbuf        
+        return scaled_pixbuf

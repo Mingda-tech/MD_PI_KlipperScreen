@@ -235,6 +235,9 @@ class Printer:
                 macros.append(macro)
         return macros
 
+    def use_bed_move(self):
+        return "_USE_BED_MOVE" in self.get_hidden_gcode_macros()
+
     def get_heaters(self):
         heaters = []
         if "heater_bed" in self.devices:
@@ -441,4 +444,4 @@ class Printer:
         if chips:
             return chips[0].split(' ', 1)[-1].strip()
         else:
-            return None 
+            return None

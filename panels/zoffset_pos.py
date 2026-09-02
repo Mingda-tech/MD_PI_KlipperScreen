@@ -32,7 +32,7 @@ class Panel(ScreenPanel):
         z_down_image = "z-closer"
         z_up_label = _("Raise") 
         z_down_label = _("Lower")
-        if "MD_400D" in self._printer.get_gcode_macros():
+        if self._printer.use_bed_move():
             z_up_image = "bed_down"
             z_down_image = "bed_up"
             z_up_label = _("Lower")
@@ -84,7 +84,7 @@ class Panel(ScreenPanel):
                 grid.attach(self.buttons['x-'], 2, 1, 1, 1)
             grid.attach(self.buttons['y+'], 1, 0, 1, 1)
             grid.attach(self.buttons['y-'], 1, 1, 1, 1)
-            if "MD_400D" in self._printer.get_gcode_macros():
+            if self._printer.use_bed_move():
                 grid.attach(self.buttons['z-'], 3, 0, 1, 1)
                 grid.attach(self.buttons['z+'], 3, 1, 1, 1)
             else:
@@ -313,4 +313,4 @@ class Panel(ScreenPanel):
             _("Saved successfully!") + "\n\n" + _("Need reboot, relaunch immediately?"),
             "printer.gcode.script",
             script
-        )                
+        )

@@ -80,6 +80,12 @@ class Panel(ScreenPanel):
             self.change_dir(None, "gcodes")
         self._refresh_files()
 
+    def _has_independent_dual_extruder(self):
+        return (
+            any(macro.startswith("MD_400D") for macro in self._printer.get_gcode_macros())
+            or "_USE_INDEPENDENT_DUAL_EXTRUDER" in self._printer.get_hidden_gcode_macros()
+        )
+
     def add_directory(self, directory, show=True):
         parent_dir = os.path.dirname(directory)
         modified = 0
@@ -303,7 +309,7 @@ class Panel(ScreenPanel):
             {"name": _("Cancel"), "response": Gtk.ResponseType.CANCEL}
         ]
 
-        if 'MD_400D' in self._printer.get_gcode_macros():
+        if self._has_independent_dual_extruder():
             buttons = [
                 {"name": _("Copy Print"), "response": Gtk.ResponseType.YES},
                 {"name": _("Mirror Print"), "response": Gtk.ResponseType.APPLY},
@@ -338,7 +344,7 @@ class Panel(ScreenPanel):
         self._gtk.remove_dialog(dialog)
         if response_id == Gtk.ResponseType.OK:
             logging.info(f"Starting print: {filename}")
-            if 'MD_400D' in self._printer.get_gcode_macros():
+            if self._has_independent_dual_extruder():
                 self._screen._ws.klippy.gcode_script("M605 S1")
         elif response_id == Gtk.ResponseType.YES:
             logging.info(f"Starting copy print: {filename}")
