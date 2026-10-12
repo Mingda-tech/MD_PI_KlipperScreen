@@ -141,7 +141,7 @@ class Panel(ScreenPanel):
         # Check if this is MD_400D model
         if self._screen.setup_init < 2:
             self._screen.setup_init = 2
-        if self._screen.printer and "MD_400D" in self._screen.printer.get_gcode_macros():
+        if self._screen.printer and any(macro.startswith("MD_400D") for macro in self._printer.get_gcode_macros()):
             # For MD_400D, skip directly to WiFi selection
             self._screen.save_init_step()
             self._screen.show_panel("select_wifi", _("Select WiFi"), remove_all=True)
